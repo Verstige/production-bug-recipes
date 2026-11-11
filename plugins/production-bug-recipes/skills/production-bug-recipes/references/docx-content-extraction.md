@@ -1,0 +1,110 @@
+# Extracting Structured Content from Word .docx (Sep 10, 2026)
+
+## When to Use
+
+When the user provides a `.docx` with content that's structured but **lost its visual structure** when flattened to plain text — terms joined to their definitions by a single space, list numbers stripped, soft line breaks collapsed. Examples: flashcard decks, glossaries, FAQ banks, Q&A lists, curricula.
+
+## Why Flat-Text Parsing Fails
+
+The naive approach (`pandoc file.docx -t plain | grep ...`) gives you:
+
+```
+1.  What is Forex? The global market where currencies are traded against each other. Largest financial market in the world.
+```
+
+The card number `1.` is **stripped by Word's automatic list numbering** (it's a property of the paragraph, not a run). The soft line break between the term "What is Forex?" and the body "The global market..." gets collapsed to a single space. Naive regex on this text can't tell where the term ends and the body begins.
+
+## The Fix: Use `para.runs` from python-docx
+
+`python-docx` exposes each paragraph's **runs** as separate text segments. Where Word's UI shows a line break or a styled fragment, you get a new run. This is the structural information you actually need.
+
+```python
+from docx import Document
+import re
+
+doc = Document('input.docx')
+for para in doc.paragraphs:
+    text = para.text.strip()
+    if not text:
+        continue
+    runs = [r.text for r in para.runs if r.text]
+    # For flashcard decks: run[0] = "term " (with trailing space)
+    #                       run[1] = "body..."
+    first_run = runs[0].strip()
+    body = ' '.join(r.strip() for r in runs[1:] if r.strip())
+    # ... process as you see fit
+```
+
+## Worked Example: Flashcard Doc → SQL Migration
+
+The user sent `the platform_Education_Optimized_Flashcards.docx` (61 cards across 9 modules, 4 tracks). Cards had:
+
+- Word's auto-list-number prefix `1.` (gone from runs)
+- Soft line break between term and body
+- Question lines with `→` separator (also got flattened to one line)
+
+**First attempt (failed)**: regex on flattened text looking for `.` followed by space-then-uppercase. Split inside the term itself ("Candlestick body" → term = "Candlestick body Distance between open and close", back = "Large body =").
+
+**Working approach**: read `para.runs[0]` as the term, `para.runs[1]` as the body. Verified structure by spot-checking paragraphs 12–16, 38–40, 54–56, 64–66 — every card was exactly 2 runs.
+
+```python
+# Card parser
+m = re.match(r'^(\d+)\.\s+(.+)$', first_run)  # for cards that retain their number
+# OR if number is stripped:
+term = first_run.strip()
+body_parts = [r.strip() for r in runs[1:] if r.strip()]
+back = ' '.join(body_parts).strip()
+```
+
+```python
+# Question parser (line with "→" separator)
+if current_quiz and ' → ' in text and not text.startswith('Micro-Quiz'):
+    m = re.match(r'^(.+?)\s+→\s+(.+)$', text)
+    if m:
+        prompt = m.group(1).strip()
+        answer = m.group(2).strip()
+        # Detect True/False vs MCQ from answer content
+        if answer.lower() in ('true', 'false'):
+            kind = 'truefalse'
+            options = ['True', 'False']
+            correct = {'answer': answer.lower() == 'true'}
+```
+
+## The SQL Generation Pattern
+
+Once the docx is parsed into a structured tree (`modules → sets → cards + quizzes → questions`), generate the SQL by:
+
+1. **Wipe existing track content** first (in FK-safe order: `quiz_questions → user_lesson_progress → quiz_attempts (CASCADE) → lesson_sections → lessons → quizzes → modules`)
+2. **Re-insert** the parsed content with `ON CONFLICT DO NOTHING` clauses
+3. **Use `SELECT ... FROM public.education_modules WHERE slug = '...'`** to look up IDs, so the migration is portable across environments
+
+For each lesson:
+```sql
+INSERT INTO public.education_lessons (module_id, slug, title, summary, est_minutes, order_idx)
+SELECT m.id, 'm1-set-a', 'Markets & Timeframes — Set A', 'Cards 1-4', 3, 1
+FROM public.education_modules m WHERE m.slug = 'markets-timeframes';
+```
+
+For each card (flashcard section):
+```sql
+INSERT INTO public.education_lesson_sections (lesson_id, order_idx, kind, title, body_md, flashcard_term, flashcard_back_md)
+SELECT l.id, 1, 'flashcard', 'What is Forex?', 
+       '**What is Forex?** — The global market where currencies are traded against each other. Largest financial market in the world.',
+       'What is Forex?', 'The global market where currencies are traded against each other. Largest financial market in the world.'
+FROM public.education_lessons l JOIN public.education_modules m ON m.id = l.module_id
+WHERE m.slug = 'markets-timeframes' AND l.slug = 'm1-set-a';
+```
+
+## Pitfalls
+
+1. **Module numbers in the doc reset per track** — "Module 1" appears 4 times across 4 tracks. The migration can't use `m{module_number}-set-a` as a slug (collisions). Use `module['slug'] + '-set-a'` (e.g. `markets-timeframes-set-a`, `key-levels-liquidity-set-a`) which is globally unique.
+2. **List numbers are auto-generated by Word** — `numId` is on the paragraph, not the run. If you need to preserve the numbering, derive it from positional counters in your parser, not from the text.
+3. **Card numbers are a property of the docx layout, not the content** — when a card says "1." at the start, that's Word's auto-list-numbering. `first_run.text` won't contain "1. ". Increment a counter in your parser instead.
+4. **Question types can be inferred from the answer text** — `True`/`False` answers are true/false questions; everything else is an MCQ. Don't assume MCQ has separate options; if the doc only stores the answer (not the distractor list), store a single-option MCQ.
+5. **Reuse the existing 4-track schema** — when the new doc has 4 tracks that map cleanly to existing track IDs (`foundations`, `charting`, `risk`, `live`), don't create new tracks. `UPDATE` the existing `live` track in place if its title/description needs to change.
+
+## When NOT to Use This
+
+- If the user provides a `.pdf` instead, use `pdf-data-extraction` (different skill)
+- If the content is plain text already (Markdown, JSON, CSV), no python-docx needed
+- If the docx is highly tabular (tables with merged cells), python-docx handles it but the run-based heuristic doesn't apply — use `doc.tables` instead

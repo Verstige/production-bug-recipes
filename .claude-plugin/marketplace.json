@@ -1,0 +1,19 @@
+{
+  "name": "production-bug-recipes",
+  "description": "Fix recurring production bugs: the symptom, the actual cause, and the fix for migrations that half-apply, caches that go stale, and auth that works until it does not.",
+  "owner": {
+    "name": "Julylan Johnson",
+    "url": "https://github.com/Verstige"
+  },
+  "metadata": {
+    "description": "Fix recurring production bugs: the symptom, the actual cause, and the fix for migrations that half-apply, caches that go stale, and auth that works until it does not.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "production-bug-recipes",
+      "source": "./plugins/production-bug-recipes",
+      "description": "Fix recurring production bugs: the symptom, the actual cause, and the fix for migrations that half-apply, caches that go stale, and auth that works until it does not."
+    }
+  ]
+}
